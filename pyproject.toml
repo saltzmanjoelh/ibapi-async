@@ -1,0 +1,33 @@
+[tool.poetry]
+name = "ibapi-async"
+version = "0.1.0"
+description = "asyncio wrapper for the Interactive Brokers Python API (ibapi)"
+authors = ["Joel Saltzman <kimchi.gamble0l@gmail.com>"]
+readme = "README.md"
+packages = [{include = "ibapi_async"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+ibapi = { git = "https://github.com/saltzmanjoelh/ibapi.git", branch = "stable" }
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+pytest-asyncio = "^0.25"
+pytest-cov = "^6.0"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+addopts = "-m 'not integration'"
+markers = [
+    "integration: tests that require a live IB Gateway / paper trading account (run with `pytest -m integration tests/integration/`)",
+]
+filterwarnings = [
+    # pytest-asyncio < 1.0 still uses asyncio.get_event_loop_policy(), which is
+    # deprecated in Python 3.12+ and slated for removal in 3.16. Until we
+    # upgrade pytest-asyncio (or it's fixed upstream), silence the noise.
+    "ignore:.*event_loop_policy.*:DeprecationWarning:pytest_asyncio",
+]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

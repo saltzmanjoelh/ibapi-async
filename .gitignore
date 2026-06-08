@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local-only profile suite. It path-depends on a private repo (ibkr_core)
+# and benchmarks it; committing would leak that repo's existence in a
+# public repo. Keep on disk for local benchmarking; don't ship.
+/profile/
+
+# Claude Code local-only overrides + macOS Finder noise
+.claude/settings.local.json
+.DS_Store

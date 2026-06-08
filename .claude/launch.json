@@ -1,0 +1,52 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "react-prod",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-lc",
+        "cd /Users/joelsaltzman/PycharmProjects/ibkr/tradingstrategies_react && VITE_API_PROXY_TARGET=https://t.joelsaltzman.com API_BASE_URL=https://t.joelsaltzman.com VITE_DEV_MODE_LABEL='tunnel mode → https://t.joelsaltzman.com' pnpm dev --port 4174 --host 127.0.0.1"
+      ],
+      "port": 4174
+    },
+    {
+      "name": "react",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-lc",
+        "cd /Users/joelsaltzman/PycharmProjects/ibkr/tradingstrategies_react && VITE_DEV_MODE_LABEL='full local → http://localhost:8001' pnpm dev --port 4174 --host 127.0.0.1"
+      ],
+      "port": 4174
+    },
+    {
+      "name": "ibkr_core-stack",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-lc",
+        "/Users/joelsaltzman/PycharmProjects/ibkr/ibkr_core/scripts/local-dev/start-local-dev.sh"
+      ],
+      "port": 8001
+    },
+    {
+      "name": "local-gateway",
+      "runtimeExecutable": "docker",
+      "runtimeArgs": [
+        "compose",
+        "--project-directory",
+        "/Users/joelsaltzman/PycharmProjects/ibkr/ibkr_core",
+        "up",
+        "ibgateway"
+      ],
+      "port": 4002
+    },
+    {
+      "name": "ssm-gateway-tunnel",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "/Users/joelsaltzman/PycharmProjects/ibkr/ibkr_core/scripts/start-gateway-tunnel.sh"
+      ],
+      "port": 4002
+    }
+  ]
+}

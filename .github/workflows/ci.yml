@@ -1,0 +1,273 @@
+name: CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      gateway_source:
+        description: 'Integration gateway source: auto (tunnel→docker fallback), tunnel (AWS only), docker (local only)'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - tunnel
+          - docker
+  push:
+    branches: ['**']
+
+jobs:
+  test:
+    name: test (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    # Backstop against a hung test holding a runner for the full 6h default
+    # (the integration leg's gateway startup + suite tops out around ~15 min).
+    timeout-minutes: 25
+
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [unit, integration]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Poetry
+        run: pip install poetry
+
+      - name: Install dependencies
+        run: poetry install
+
+      # ── unit suite: everything except @pytest.mark.integration ────────────
+      - name: Run unit tests
+        if: matrix.suite == 'unit'
+        run: poetry run pytest tests/ -v --tb=short --cov=ibapi_async --cov-report=term-missing --ignore=tests/integration
+
+      # ── integration suite: hits a real Gateway. Two sources:
+      #   tunnel  – SSM port-forward to the AWS-hosted ECS task (production).
+      #   docker  – pull/start ghcr.io/saltzmanjoelh/ibgateway:main locally
+      #             (handled by tests/integration/conftest.py autostart).
+      # 'auto' tries tunnel first; falls back to docker autostart on failure.
+      - name: Resolve gateway source (integration)
+        if: matrix.suite == 'integration'
+        id: gw_src
+        run: |
+          requested='${{ github.event.inputs.gateway_source }}'
+          requested="${requested:-auto}"
+          echo "requested=$requested" >> "$GITHUB_OUTPUT"
+          echo "Requested gateway_source: $requested"
+
+      # ── Tunnel attempt (tunnel | auto) ─────────────────────────────────
+      - name: Configure AWS credentials (tunnel attempt)
+        if: matrix.suite == 'integration' && steps.gw_src.outputs.requested != 'docker'
+        id: aws_creds
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Install Session Manager plugin (tunnel attempt)
+        if: matrix.suite == 'integration' && steps.gw_src.outputs.requested != 'docker' && steps.aws_creds.outcome == 'success'
+        id: smp
+        continue-on-error: true
+        run: |
+          curl -sSL "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" \
+            -o /tmp/session-manager-plugin.deb
+          sudo dpkg -i /tmp/session-manager-plugin.deb
+
+      - name: Start SSM tunnel to AWS gateway (tunnel attempt)
+        if: matrix.suite == 'integration' && steps.gw_src.outputs.requested != 'docker' && steps.aws_creds.outcome == 'success' && steps.smp.outcome == 'success'
+        id: tunnel_try
+        continue-on-error: true
+        env:
+          STACK_NAME: ibkr-core
+          ENVIRONMENT: production
+          IBGATEWAY_MODE: paper
+          IBGATEWAY_PORT: "4002"
+        run: |
+          set -x
+          aws sts get-caller-identity
+          TUNNEL_LOG=/tmp/ibkr-gateway-tunnel.log
+          : > "$TUNNEL_LOG"
+          nohup bash scripts/start-gateway-tunnel.sh > "$TUNNEL_LOG" 2>&1 &
+          TUNNEL_PID=$!
+          echo "$TUNNEL_PID" > /tmp/ibkr-gateway-tunnel.pid
+          echo "→ Tunnel script backgrounded as PID $TUNNEL_PID; log: $TUNNEL_LOG"
+
+          # Wait for the API listener (4002) — it's the only one tests actually need.
+          # Other ports (8080, 5900) are nice-to-have for debugging but not required.
+          ready=0
+          for i in $(seq 1 60); do
+            if ss -ltn "sport = :4002" 2>/dev/null | grep -q LISTEN; then
+              echo "  ✓ port 4002 listening (after ${i}s)"
+              ready=1
+              break
+            fi
+            if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+              echo "  ✗ tunnel script (PID ${TUNNEL_PID}) exited before port 4002 came up"
+              break
+            fi
+            sleep 1
+          done
+
+          echo
+          echo "--- Tunnel script log ---"
+          cat "$TUNNEL_LOG" || true
+          echo "--- Per-port SSM logs ---"
+          for f in /tmp/ibkr-tunnel-*.log; do
+            [ -e "$f" ] || continue
+            echo "== $f =="
+            cat "$f"
+          done
+
+          if [ "$ready" != "1" ]; then
+            echo "::error::API tunnel listener (4002) failed to come up"
+            exit 1
+          fi
+
+      # Hard-fail the job if AWS itself rejected the SSM call (AccessDenied,
+      # bad credentials, etc.) — that's a real config bug, not a transient
+      # "tunnel unreachable" condition the auto-fallback should mask.
+      - name: Fail on AWS authorization/credential error
+        if: matrix.suite == 'integration' && steps.gw_src.outputs.requested != 'docker' && steps.smp.outcome == 'success'
+        run: |
+          shopt -s nullglob
+          logs=(/tmp/ibkr-tunnel-*.log /tmp/ibkr-gateway-tunnel.log)
+          if [ ${#logs[@]} -eq 0 ]; then
+            echo "No tunnel logs to inspect; skipping AWS-error scan."
+            exit 0
+          fi
+          pattern='AccessDeniedException|UnauthorizedOperation|InvalidClientTokenId|SignatureDoesNotMatch|ExpiredToken|InvalidUserID\.NotFound'
+          if grep -E -q "$pattern" "${logs[@]}"; then
+            echo "::error::AWS returned an authorization/credential error during tunnel setup. Failing CI."
+            grep -E -n "$pattern" "${logs[@]}" || true
+            exit 1
+          fi
+          echo "No AWS authorization/credential errors found in tunnel logs."
+
+      - name: Resolve effective gateway mode (integration)
+        if: matrix.suite == 'integration'
+        id: gw_mode
+        run: |
+          requested='${{ steps.gw_src.outputs.requested }}'
+          tunnel_outcome='${{ steps.tunnel_try.outcome }}'
+          if [[ "$requested" == "docker" ]]; then
+            mode=docker
+          elif [[ "$requested" == "tunnel" ]]; then
+            if [[ "$tunnel_outcome" != "success" ]]; then
+              echo "::error::gateway_source=tunnel requested but tunnel setup failed (aws_creds=${{ steps.aws_creds.outcome }}, smp=${{ steps.smp.outcome }}, tunnel=${tunnel_outcome})"
+              exit 1
+            fi
+            mode=tunnel
+          else
+            if [[ "$tunnel_outcome" == "success" ]]; then
+              mode=tunnel
+            else
+              echo "::warning::SSM tunnel unavailable (aws_creds=${{ steps.aws_creds.outcome }}, smp=${{ steps.smp.outcome }}, tunnel=${tunnel_outcome}); falling back to local docker ibgateway"
+              mode=docker
+            fi
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "Effective gateway mode: $mode"
+
+      # ── Docker mode: conftest.py autostart pulls and runs the gateway image.
+      # Just verify the credentials are present so we fail early with a clear message.
+      - name: Verify IB Gateway secrets (docker mode)
+        if: matrix.suite == 'integration' && steps.gw_mode.outputs.mode == 'docker'
+        env:
+          IBGATEWAY_USERNAME: ${{ secrets.IBGATEWAY_USERNAME }}
+          IBGATEWAY_PASSWORD: ${{ secrets.IBGATEWAY_PASSWORD }}
+        run: |
+          if [ -z "$IBGATEWAY_USERNAME" ] || [ -z "$IBGATEWAY_PASSWORD" ]; then
+            echo "::error::IBGATEWAY_USERNAME and IBGATEWAY_PASSWORD secrets are required for docker mode."
+            exit 1
+          fi
+
+      # ── Tunnel mode: precheck the gateway is actually logged in.
+      # The SSM forward only proves the TCP socket on 4002 is open (socat
+      # forwards regardless of the gateway's auth state). After an ECS task
+      # replacement the new gateway often boots stuck on a login/MFA dialog —
+      # 4002 listens, but the API never issues `nextValidId`, and every test
+      # eats the full 10s handshake timeout for nothing. Hit the screenshot
+      # service's /health (it inspects the connection-status table colours)
+      # and bail out fast with the screenshot attached if it isn't green.
+      - name: Precheck gateway health (tunnel mode)
+        if: matrix.suite == 'integration' && steps.gw_mode.outputs.mode == 'tunnel'
+        run: |
+          set +e
+          # Gate on the per-row colour of the API server line, NOT the overall
+          # health. `overall=degraded` flips on any inactive market/historical
+          # data farm (those are upstream IBKR transient outages and don't
+          # break API handshakes). What we actually need is api_server: green.
+          # If that row is dark/unknown the gateway UI isn't on its
+          # connection-status screen — almost always a login/MFA dialog,
+          # which IS unrecoverable from CI.
+          body=""
+          api_color=unknown
+          for i in $(seq 1 6); do
+            body=$(curl -sS -m 10 http://127.0.0.1:8080/health 2>/dev/null)
+            api_color=$(echo "$body" | jq -r '.rows[] | select(.name=="api_server") | .color' 2>/dev/null || echo unknown)
+            overall=$(echo "$body" | jq -r .overall 2>/dev/null || echo unknown)
+            echo "Health attempt $i/6: api_server=$api_color overall=$overall"
+            [ "$api_color" = "green" ] && break
+            sleep 15
+          done
+          echo "$body" > /tmp/gw-health.json
+          # Always grab a screenshot so we can see the on-screen state even
+          # when the precheck passes — useful for diagnosing soft regressions.
+          if curl -sS -m 10 http://127.0.0.1:8080/screenshot -o /tmp/gw-shot-meta.json; then
+            url=$(jq -r .url /tmp/gw-shot-meta.json 2>/dev/null || echo "")
+            [ -n "$url" ] && curl -sS -m 10 -o /tmp/gw-shot.png "http://127.0.0.1:8080${url}" || true
+          fi
+          if [ "$api_color" != "green" ]; then
+            echo "::error::Gateway api_server row is not green after 90s of polling (api_server=$api_color). The ECS task is most likely on a login/MFA/error dialog — the SSM forward to 4002 is open but the gateway can't complete an API handshake until it's interactively recovered. Download the 'gateway-state' artifact to see the on-screen UI."
+            jq . /tmp/gw-health.json 2>/dev/null || echo "$body"
+            exit 1
+          fi
+
+      - name: Upload gateway state (always)
+        if: ${{ always() && matrix.suite == 'integration' && steps.gw_mode.outputs.mode == 'tunnel' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-state-${{ github.run_attempt }}
+          path: |
+            /tmp/gw-shot.png
+            /tmp/gw-health.json
+            /tmp/gw-shot-meta.json
+          if-no-files-found: ignore
+
+      # ── Run integration tests ──────────────────────────────────────────
+      # Tunnel mode: gateway reachable on 127.0.0.1:4002 (tests run on the
+      # runner host, no docker network indirection needed).
+      - name: Run integration tests (tunnel mode)
+        if: matrix.suite == 'integration' && steps.gw_mode.outputs.mode == 'tunnel'
+        env:
+          IBKR_GATEWAY_HOST: 127.0.0.1
+          IBKR_GATEWAY_PORT: "4002"
+          IBKR_GATEWAY_DOCKER_AUTOSTART: "0"
+        run: poetry run pytest -v -m integration tests/integration/
+
+      # Docker mode: conftest.py autostarts the ibgateway container (3-5 min first run).
+      - name: Run integration tests (docker mode)
+        if: matrix.suite == 'integration' && steps.gw_mode.outputs.mode == 'docker'
+        env:
+          IBKR_GATEWAY_HOST: 127.0.0.1
+          IBKR_GATEWAY_PORT: "4002"
+          IBKR_GATEWAY_DOCKER_AUTOSTART: "1"
+          IBKR_GATEWAY_DOCKER_STARTUP_TIMEOUT: "600"
+          IBGATEWAY_USERNAME: ${{ secrets.IBGATEWAY_USERNAME }}
+          IBGATEWAY_PASSWORD: ${{ secrets.IBGATEWAY_PASSWORD }}
+        run: poetry run pytest -v -m integration tests/integration/
+
+      - name: Stop SSM tunnel (cleanup)
+        if: ${{ always() && matrix.suite == 'integration' && steps.gw_mode.outputs.mode == 'tunnel' }}
+        run: bash scripts/stop-gateway-tunnel.sh || true
+
+      - name: Tear down ibgateway container (cleanup)
+        if: ${{ always() && matrix.suite == 'integration' && steps.gw_mode.outputs.mode == 'docker' }}
+        run: docker rm -f ibgateway-test || true
